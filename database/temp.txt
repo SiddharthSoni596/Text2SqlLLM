@@ -1,0 +1,102 @@
+import argparse
+import sqlite3
+import pandas as pd
+from google.cloud import bigquery
+from google.cloud.bigquery import SchemaField, LoadJobConfig, WriteDisposition
+import os
+
+SQLITE_TO_BQ = {
+    'INTEGER': 'INT64',
+    'REAL': 'FLOAT64',
+    'TEXT': 'STRING',
+    'BLOB': 'BYTES',
+    'NUMERIC': 'NUMERIC',
+    'BOOLEAN': 'BOOL',
+    'DATE': 'DATE',
+    'DATETIME': 'DATETIME'
+}
+
+def map_sqlite_type(sqlite_type):
+    for key in SQLITE_TO_BQ:
+        if key in sqlite_type.upper():
+            return SQLITE_TO_BQ[key]
+    return 'STRING'
+
+def extract_table_schema(conn, table_name):
+    cursor = conn.execute(f'PRAGMA table_info({table_name});')
+    schema = []
+    col_types = {}
+    for row in cursor.fetchall():
+        name, sqlite_type = row[1], row[2]
+        bq_type = map_sqlite_type(sqlite_type)
+        schema.append(SchemaField(name, bq_type, mode='NULLABLE'))
+        col_types[name] = sqlite_type.upper()
+    return schema, col_types
+
+def create_table(conn, table_name, dataset_id, bq_client):
+    schema, _ = extract_table_schema(conn, table_name)
+    table_ref = bq_client.dataset(dataset_id).table(table_name)
+    table = bigquery.Table(table_ref, schema=schema)
+    try:
+        bq_client.create_table(table, exists_ok=True)
+        print(f"[✓] Table `{table_name}` created or updated.")
+    except Exception as e:
+        print(f"[!] Error creating table `{table_name}`: {e}")
+    return schema
+
+def format_date_columns(df, col_types):
+    for col, dtype in col_types.items():
+        if "DATE" in dtype:
+            try:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+                if "DATETIME" in dtype:
+                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    df[col] = df[col].dt.strftime('%Y-%m-%d')
+            except Exception as e:
+                print(f"[!] Error parsing datetime column `{col}`: {e}")
+    return df.where(pd.notnull(df), None)
+
+def load_data_to_bq(df, table_ref, schema, bq_client):
+    job_config = LoadJobConfig(
+        schema=schema,
+        write_disposition=WriteDisposition.WRITE_TRUNCATE,
+        source_format=bigquery.SourceFormat.PARQUET # This is ignored for DF but required
+    )
+    job = bq_client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+    job.result()
+    print(f"[✓] Loaded {len(df)} rows into `{table_ref.table_id}` (overwrite).")
+
+def migrate_table(conn, table_name, dataset_id, bq_client):
+    schema, col_types = extract_table_schema(conn, table_name)
+    table_ref = bq_client.dataset(dataset_id).table(table_name)
+    create_table(conn, table_name, dataset_id, bq_client)
+
+    df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+    df = format_date_columns(df, col_types)
+    load_data_to_bq(df, table_ref, schema, bq_client)
+
+def migrate_sqlite_to_bq(sqlite_path, dataset_id):
+    conn = sqlite3.connect(sqlite_path)
+    bq_client = bigquery.Client()
+
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)['name'].tolist()
+
+    for table in tables:
+        print(f"\n--- Processing table `{table}` ---")
+        migrate_table(conn, table, dataset_id, bq_client)
+
+    conn.close()
+    print("\n[✓] Full migration complete.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Migrate SQLite DB to BigQuery with truncate and strict schema.")
+    parser.add_argument("sqlite_path", help="Path to the .sqlite file")
+    parser.add_argument("dataset_id", help="BigQuery dataset ID (e.g., my_project.my_dataset)")
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.sqlite_path):
+        print(f"[X] SQLite file not found: {args.sqlite_path}")
+    else:
+        migrate_sqlite_to_bq(args.sqlite_path, args.dataset_id)
