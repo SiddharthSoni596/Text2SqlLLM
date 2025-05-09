@@ -4,6 +4,7 @@ import pandas as pd
 from google.cloud import bigquery
 from google.cloud.bigquery import SchemaField, LoadJobConfig, WriteDisposition
 import os
+my name is sid
 
 SQLITE_TO_BQ = {
     'INTEGER': 'INT64',
